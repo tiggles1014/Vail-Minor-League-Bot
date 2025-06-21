@@ -1,3 +1,12 @@
+let botStarted = false
+client.once('ready', async () => {
+  if (botStarted) return;  // If already started, ignore this event again
+  botStarted = true;       // Mark that the bot has started
+
+  console.log(`🤖 Bot is ready as ${client.user.tag}`);
+
+  // ... your existing ready event code here ...
+});
 
 // Full bot code with all features combined.
 
