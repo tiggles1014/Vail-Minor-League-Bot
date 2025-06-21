@@ -1,20 +1,8 @@
-let botStarted = false
-client.once('ready', async () => {
-  if (botStarted) return;  // If already started, ignore this event again
-  botStarted = true;       // Mark that the bot has started
-
-  console.log(`🤖 Bot is ready as ${client.user.tag}`);
-
-  // ... your existing ready event code here ...
-});
-
-// Full bot code with all features combined.
-
 const { Client, GatewayIntentBits, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Partials } = require('discord.js');
 const express = require('express');
 const fs = require('fs');
 
-const BOT_OWNER_ID = '814297978620739595';
+const BOT_OWNER_ID = '814297978620739595'; // Your Discord user ID
 const app = express();
 app.get('/', (_, res) => res.send('Bot is alive!'));
 app.listen(3000, () => console.log('🌐 Express server running on port 3000'));
@@ -36,14 +24,16 @@ let playerData = {};
 let checkInStatus = {};
 let timeouts = {};
 let queueTimeouts = {};
+
 let currentMatchTimeout = null;
-let matchCheckInCountdowns = {};
+let matchCheckInCountdowns = {}; // userId -> { interval, msg }
 
 try { playerData = JSON.parse(fs.readFileSync('playerData.json', 'utf8')); } catch { playerData = {}; }
 try { queueTimeouts = JSON.parse(fs.readFileSync('timeouts.json', 'utf8')); } catch { queueTimeouts = {}; }
 
 function savePlayerData() { fs.writeFileSync('playerData.json', JSON.stringify(playerData, null, 2)); }
 function saveQueueTimeouts() { fs.writeFileSync('timeouts.json', JSON.stringify(queueTimeouts, null, 2)); }
+
 function isUserTimedOut(userId) {
   const expiresAt = queueTimeouts[userId];
   if (!expiresAt) return false;
@@ -72,7 +62,7 @@ function startTimeout(user) {
   const warning = setTimeout(async () => {
     try {
       const dm = await user.createDM();
-      await dm.send('⚠️ You will be removed from the queue in 5 minutes due to inactivity.');
+      await dm.send('⚠️ You will be removed from the queue in 5 minutes due to inactivity. Please re-queue if you’re still playing.');
     } catch {}
   }, 25 * 60 * 1000);
 
@@ -91,6 +81,7 @@ function clearTimeouts(userId) {
     delete timeouts[userId];
   }
 }
+
 async function createMatchChannel(guild, players) {
   const sorted = [...players].sort((a, b) => calculateRank(b) - calculateRank(a));
   const team1 = [], team2 = [];
@@ -104,6 +95,12 @@ async function createMatchChannel(guild, players) {
   const checkInButtons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('check_in').setLabel('✅ Check In').setStyle(ButtonStyle.Success)
   );
+
+  const formatCheckInMessage = () => {
+    const checked = players.filter(p => checkInStatus[p.id]).map(p => p.username).join('\n') || 'None';
+    const notChecked = players.filter(p => !checkInStatus[p.id]).map(p => p.username).join('\n') || 'None';
+    return `🏁 **Match Check-In**\n\n✅ **Checked In:**\n${checked}\n\n⏳ **Not Checked In:**\n${notChecked}`;
+  };
 
   const channel = await guild.channels.create({
     name: `match-${Date.now()}`,
@@ -120,47 +117,89 @@ async function createMatchChannel(guild, players) {
   await channel.send(`🏆 Match Started!
 **Team 1:** ${team1.map(p => p.username).join(', ')} (Leader: ${team1Leader.username})
 **Team 2:** ${team2.map(p => p.username).join(', ')} (Leader: ${team2Leader.username})
+
 Team leaders, report result with: \`!report team1\` or \`!report team2\``);
 
   const checkInMsg = await channel.send({
-    content: '🏁 Match Check-In\n⏳ You have 5 minutes to check in using the button below.',
+    content: formatCheckInMessage(),
     components: [checkInButtons]
   });
 
+  // Send DMs with countdown to all players
   for (const player of players) {
     try {
       const dm = await player.createDM();
       const msg = await dm.send(`🔔 You have 5 minutes to check in for your match.\n⏳ Time remaining: **5 minutes**`);
       let timeLeft = 5;
-      const interval = setInterval(() => {
+
+      const interval = setInterval(async () => {
         timeLeft--;
         if (timeLeft > 0) {
-          msg.edit(`🔔 Please check in.\n⏳ Time remaining: **${timeLeft} minute${timeLeft !== 1 ? 's' : ''}**`);
+          try {
+            await msg.edit(`🔔 You have 5 minutes to check in for your match.\n⏳ Time remaining: **${timeLeft} minute${timeLeft !== 1 ? 's' : ''}**`);
+          } catch {}
         } else {
           clearInterval(interval);
         }
       }, 60 * 1000);
+
       matchCheckInCountdowns[player.id] = { interval, msg };
-    } catch {}
+    } catch (e) {
+      console.log(`⚠️ Failed to DM ${player.username}`);
+    }
   }
 
+  // Start 5-minute auto-cancel timeout
   currentMatchTimeout = setTimeout(async () => {
     const notChecked = players.filter(p => !checkInStatus[p.id]);
     if (notChecked.length > 0) {
-      await channel.send('⏱️ Match cancelled: Not all players checked in.');
+      await channel.send('⏱️ Match cancelled: Not all players checked in within 5 minutes.');
+
       for (const player of players) {
         if (!queue.find(p => p.id === player.id)) {
           queue.push(player);
           startTimeout(player);
         }
+
+        // Stop countdown message
         if (matchCheckInCountdowns[player.id]) {
           clearInterval(matchCheckInCountdowns[player.id].interval);
+          delete matchCheckInCountdowns[player.id];
         }
       }
+
       await channel.delete().catch(() => {});
     }
   }, 5 * 60 * 1000);
 }
+
+let botStarted = false;
+
+client.once('ready', async () => {
+  if (botStarted) return;
+  botStarted = true;
+
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+
+  const channelId = process.env.CHANNEL_ID;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+
+  // Try to delete old queue message
+  try {
+    const data = JSON.parse(fs.readFileSync(queueMessageFile, 'utf8'));
+    const oldMsg = await channel.messages.fetch(data.messageId);
+    if (oldMsg) await oldMsg.delete();
+  } catch {}
+
+  // Send new queue message
+  const newMsg = await channel.send({
+    content: '🎮 Click a button to interact with the queue:',
+    components: [queueButtons()]
+  });
+  fs.writeFileSync(queueMessageFile, JSON.stringify({ messageId: newMsg.id }, null, 2));
+});
+
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
   const user = interaction.user;
@@ -206,6 +245,7 @@ client.on('interactionCreate', async interaction => {
 
     checkInStatus[interaction.user.id] = true;
 
+    // Stop countdown for this player
     if (matchCheckInCountdowns[interaction.user.id]) {
       clearInterval(matchCheckInCountdowns[interaction.user.id].interval);
       delete matchCheckInCountdowns[interaction.user.id];
@@ -224,11 +264,13 @@ client.on('interactionCreate', async interaction => {
       components: message.components
     });
 
+    // If all players checked in, clear timeout & countdowns
     if (Object.values(checkInStatus).every(v => v === true)) {
       if (currentMatchTimeout) {
         clearTimeout(currentMatchTimeout);
         currentMatchTimeout = null;
       }
+
       for (const playerId in matchCheckInCountdowns) {
         clearInterval(matchCheckInCountdowns[playerId].interval);
         delete matchCheckInCountdowns[playerId];
@@ -236,6 +278,7 @@ client.on('interactionCreate', async interaction => {
     }
   }
 });
+
 client.on('messageCreate', async message => {
   if (!message.content.startsWith('!')) return;
 
@@ -333,9 +376,6 @@ client.on('messageCreate', async message => {
     message.channel.send('🗑️ All player stats have been reset.');
   }
 });
+
 console.log('Token:', process.env.TOKEN ? 'FOUND' : 'MISSING');
 client.login(process.env.TOKEN).catch(console.error);
-
-
-
-
